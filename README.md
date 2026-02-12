@@ -4,6 +4,10 @@ English documentation. For Chinese users, see [README.zh-CN.md](README.zh-CN.md)
 
 A Chrome extension for Google Gemini that opens an in-page panel when you click the extension icon, then lets you batch-download full-resolution generated images from the current conversation.
 
+## Notice
+
+This project is published for personal learning purposes only and must not be used for any commercial purposes.
+
 ## Features
 
 - In-page Shadow DOM panel (no popup page)
@@ -90,3 +94,7 @@ Build output is generated in `dist/`.
 - `activeTab`: interact with the active tab via extension action flow
 - `downloads`: call Chrome downloads API
 - `host_permissions: https://gemini.google.com/*`: inject content script and interact with Gemini page
+
+## License
+
+MIT. See [LICENSE](LICENSE).

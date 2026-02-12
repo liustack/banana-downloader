@@ -4,6 +4,10 @@
 
 这是一个用于 Google Gemini 的 Chrome 扩展：点击扩展图标后，会在页面内直接拉起面板，支持批量下载当前对话中的生成图片原图。
 
+## 使用声明
+
+本项目仅用于个人学习，禁止用于任何商业用途。
+
 ## 功能特性
 
 - 页面内 Shadow DOM 面板（不依赖 popup）
@@ -90,3 +94,7 @@ pnpm build
 - `activeTab`：处理当前活动标签页并进行 action 交互
 - `downloads`：调用 Chrome 下载 API
 - `host_permissions: https://gemini.google.com/*`：注入内容脚本并与页面交互
+
+## 许可证
+
+MIT，详见 [LICENSE](LICENSE)。
