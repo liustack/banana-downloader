@@ -17,4 +17,5 @@ export interface ImageInfo {
 export type MessageType =
     | { type: 'TOGGLE_PANEL' }
     | { type: 'OPEN_PANEL' }
-    | { type: 'DOWNLOAD_IMAGE'; dataUrl: string; filename: string };
+    | { type: 'DOWNLOAD_IMAGE'; dataUrl: string; filename: string }
+    | { type: 'SUPPRESS_DOWNLOADS'; suppress: boolean };

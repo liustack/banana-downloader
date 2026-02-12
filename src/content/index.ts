@@ -48,11 +48,12 @@ window.addEventListener('message', (event) => {
     }
 });
 
-// ── Download suppression control (talks to main-world interceptor) ───
-// Uses postMessage instead of CustomEvent because event.detail
-// cannot cross the isolated world → main world boundary in Chrome.
+// ── Download suppression control ─────────────────────────────────────
+// Notify background to cancel native blob: downloads via chrome.downloads API.
+// This is the reliable mechanism — works regardless of how the page triggers
+// the download (anchor.click, dispatchEvent, navigation, etc.)
 function setSuppressDownload(suppress: boolean): void {
-    window.postMessage({ type: 'GBD_SUPPRESS', suppress }, '*');
+    chrome.runtime.sendMessage({ type: 'SUPPRESS_DOWNLOADS', suppress });
 }
 
 // ── Find the native "Download full size" button for a given image ────
@@ -758,7 +759,6 @@ async function startDownload(): Promise<void> {
 
     // Ensure interceptor is injected and suppress native downloads
     injectInterceptor();
-    await new Promise((r) => setTimeout(r, 100));
     setSuppressDownload(true);
 
     for (let i = 0; i < selectedImages.length; i++) {

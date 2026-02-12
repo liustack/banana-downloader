@@ -41,6 +41,21 @@ chrome.action.onClicked.addListener((tab) => {
     });
 });
 
+// ── Suppress Gemini native blob downloads during batch flow ───────────
+// This is the most reliable approach: chrome.downloads.onCreated fires
+// regardless of HOW the download was initiated (anchor.click, dispatchEvent,
+// Navigation, etc.). Our own downloads use data: URLs, so we only cancel
+// blob: downloads that we didn't initiate.
+let suppressNativeDownloads = false;
+const ownDownloadIds = new Set<number>();
+
+chrome.downloads.onCreated.addListener((item) => {
+    if (suppressNativeDownloads && !ownDownloadIds.has(item.id) && item.url.startsWith('blob:')) {
+        chrome.downloads.cancel(item.id);
+        chrome.downloads.erase({ id: item.id });
+    }
+});
+
 async function processAndDownload(dataUrl: string, filename: string): Promise<{ success: boolean; error?: string }> {
     // dataUrl 由 content script 从 Gemini 原生下载流程中拦截得到
     const response = await fetch(dataUrl);
@@ -63,14 +78,18 @@ async function processAndDownload(dataUrl: string, filename: string): Promise<{ 
                     return;
                 }
 
+                ownDownloadIds.add(downloadId);
+
                 const listener = (delta: chrome.downloads.DownloadDelta) => {
                     if (delta.id !== downloadId) return;
 
                     if (delta.state?.current === 'complete') {
                         chrome.downloads.onChanged.removeListener(listener);
+                        ownDownloadIds.delete(downloadId);
                         resolve({ success: true });
                     } else if (delta.state?.current === 'interrupted') {
                         chrome.downloads.onChanged.removeListener(listener);
+                        ownDownloadIds.delete(downloadId);
                         resolve({ success: false, error: delta.error?.current });
                     }
                 };
@@ -81,6 +100,11 @@ async function processAndDownload(dataUrl: string, filename: string): Promise<{ 
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type === 'SUPPRESS_DOWNLOADS') {
+        suppressNativeDownloads = !!message.suppress;
+        return false;
+    }
+
     if (message.type === 'DOWNLOAD_IMAGE') {
         const { dataUrl, filename } = message as {
             type: 'DOWNLOAD_IMAGE';

@@ -3,16 +3,13 @@
 
   var _fetch = window.fetch;
 
-  // Listen for control messages from content script via postMessage
-  // (CustomEvent.detail cannot cross isolated world → main world boundary)
-  window.addEventListener('message', function (e) {
-    if (e.source === window && e.data && e.data.type === 'GBD_SUPPRESS') {
-      window.__gbd_suppressDownload = !!e.data.suppress;
-    }
-  });
-
-  // Patch fetch to intercept final image responses from Gemini download chain
+  // Patch fetch to intercept final image responses from Gemini download chain.
   // Redirect chain: gg-dl/ -> (text) -> rd-gg-dl/ -> (text) -> rd-gg-dl/ -> image/png
+  //
+  // Download suppression (preventing the native blob: download) is handled by
+  // the background service worker via chrome.downloads.onCreated — that approach
+  // is reliable regardless of how the page triggers downloads (anchor.click,
+  // dispatchEvent, navigation, etc.)
   window.fetch = async function () {
     var args = arguments;
     var response = await _fetch.apply(this, args);
@@ -38,15 +35,5 @@
     }
 
     return response;
-  };
-
-  // Suppress native blob downloads when our extension is actively downloading
-  var _click = HTMLAnchorElement.prototype.click;
-  HTMLAnchorElement.prototype.click = function () {
-    if (window.__gbd_suppressDownload && this.download && this.href && this.href.indexOf('blob:') === 0) {
-      try { URL.revokeObjectURL(this.href); } catch (e) { /* ignore */ }
-      return;
-    }
-    return _click.call(this);
   };
 })();
