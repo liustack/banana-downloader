@@ -2,7 +2,7 @@
 
 English documentation. For Chinese users, see [README.zh-CN.md](README.zh-CN.md).
 
-A Chrome extension for Google Gemini that opens an in-page panel when you click the extension icon, then lets you batch-download full-resolution generated images from the current conversation.
+A Chrome extension for Google Gemini that opens an in-page panel when you click the extension icon, then lets you batch-download full-resolution generated images from the current conversation — with automatic watermark removal.
 
 ## Notice
 
@@ -12,17 +12,30 @@ This project is published for personal learning purposes only and must not be us
 
 - In-page Shadow DOM panel (no popup page)
 - Automatic Gemini image detection with select all / unselect all
-- Batch download of full-resolution originals (`=s0` URL conversion)
+- Full-resolution download via simulated native button click + fetch interception
+- Automatic Gemini watermark removal (reverse alpha blending in background)
+- Batch timestamp filenames to avoid collisions (`prefix_YYYYMMDD_HHmmss_N.png`)
 - Real-time download progress and result feedback
-- Uses `chrome.downloads` so browser authentication cookies are reused
 
 ## How It Works
 
-1. Click the extension action icon (`chrome.action`)
-2. Background sends `TOGGLE_PANEL` / `OPEN_PANEL` to the Gemini tab
-3. Content script scans page images and renders the panel
-4. Content script sends `DOWNLOAD_IMAGES` to background
-5. Background calls `chrome.downloads.download()` and broadcasts progress
+The extension uses a 3-layer architecture:
+
+| Layer | File | Runtime | Role |
+|-------|------|---------|------|
+| Interceptor | `public/download-interceptor.js` | Main World | Patches `window.fetch` to capture original image blobs from Gemini's download redirect chain |
+| Content Script | `src/content/index.ts` | Isolated World | UI panel + orchestrates download flow (find button → click → wait for blob → send to background) |
+| Background | `src/background/index.ts` | Service Worker | Watermark removal + file save + native download suppression |
+
+**Download flow:**
+
+1. Click the extension action icon → background sends `TOGGLE_PANEL` to the Gemini tab
+2. Content script scans page images and renders the in-page panel
+3. User selects images and clicks download
+4. Content script injects the Main World interceptor and enables download suppression
+5. For each image serially: click native download button → interceptor captures the blob via patched `fetch` → blob is forwarded to content script via `postMessage`
+6. Content script sends `DOWNLOAD_IMAGE` (with dataUrl + filename) to background
+7. Background removes the Gemini watermark and saves the file via `chrome.downloads`
 
 ## Tech Stack
 
@@ -35,12 +48,21 @@ This project is published for personal learning purposes only and must not be us
 
 ```text
 src/
-  background/index.ts   # Action click handling + batch downloads
-  content/index.ts      # Image scanning + in-page panel UI
-  types.ts              # Shared message/data types
-public/icons/           # Extension icons
-docs/development-guide.md
+  background/index.ts          # Action click handling + watermark removal + download suppression
+  content/index.ts             # Image scanning + in-page panel UI + download orchestration
+  core/
+    watermarkEngine.ts         # Watermark removal via reverse alpha blending
+    alphaMap.ts                # Pre-computed alpha channel map
+    blendModes.ts              # Blend mode utilities
+  types.ts                     # Shared message/data types
+  assets/                      # Watermark reference images
+public/
+  download-interceptor.js      # Main World fetch patch (injected at runtime)
+  rules.json                   # Declarative net request CORS rules
+  icons/                       # Extension icons
+docs/                          # Operational & architecture docs
 manifest.json
+AGENTS.md                      # AI agent project context
 ```
 
 ## Local Development
@@ -93,7 +115,10 @@ Build output is generated in `dist/`.
 
 - `activeTab`: interact with the active tab via extension action flow
 - `downloads`: call Chrome downloads API
-- `host_permissions: https://gemini.google.com/*`: inject content script and interact with Gemini page
+- `declarativeNetRequestWithHostAccess`: modify response headers (CORS) for `lh3.googleusercontent.com` image requests
+- `host_permissions`:
+  - `https://gemini.google.com/*` — inject content script and interact with Gemini page
+  - `https://lh3.googleusercontent.com/*`, `https://lh3.google.com/*` — access image resources for watermark processing
 
 ## License
 
