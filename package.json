@@ -6,7 +6,8 @@
     "scripts": {
         "dev": "vite",
         "build": "tsc && vite build",
-        "preview": "vite preview"
+        "preview": "vite preview",
+        "docs:list": "node scripts/docs-list.mjs"
     },
     "dependencies": {},
     "devDependencies": {
