@@ -2,7 +2,9 @@
 
 English documentation. For Chinese users, see [README.zh-CN.md](README.zh-CN.md).
 
-A Chrome extension for Google Gemini that opens an in-page panel when you click the extension icon, then lets you batch-download full-resolution generated images from the current conversation — with automatic watermark removal.
+A Chrome extension that adds an in-page batch downloader on:
+- `gemini.google.com` (generated image originals + watermark removal)
+- `notebooklm.google.com` (Infographic artifacts)
 
 ## Notice
 
@@ -11,31 +13,44 @@ This project is published for personal learning purposes only and must not be us
 ## Features
 
 - In-page Shadow DOM panel (no popup page)
-- Automatic Gemini image detection with select all / unselect all
-- Full-resolution download via simulated native button click + fetch interception
-- Automatic Gemini watermark removal (reverse alpha blending in background)
-- Batch timestamp filenames to avoid collisions (`prefix_YYYYMMDD_HHmmss_N.png`)
-- Real-time download progress and result feedback
+- Site adapter architecture (`Gemini` / `NotebookLM` in separate files)
+- Gemini original-image download via native button click + fetch interception
+- NotebookLM Infographic batch download via artifact viewer image URL capture
+- Batch timestamp filenames (`prefix_YYYYMMDD_HHmmss_N.png`)
+- Reliability improvements for long pages / lazy loading:
+  - Scroll preloading before scan and download
+  - Retry with targeted container sweep
+  - Capture ID mapping to avoid blob mismatch after timeout
+  - Runtime message timeout guard
 
-## How It Works
+## Architecture
 
-The extension uses a 3-layer architecture:
+### Runtime Layers
 
 | Layer | File | Runtime | Role |
 |-------|------|---------|------|
-| Interceptor | `public/download-interceptor.js` | Main World | Patches `window.fetch` to capture original image blobs from Gemini's download redirect chain |
-| Content Script | `src/content/index.ts` | Isolated World | UI panel + orchestrates download flow (find button → click → wait for blob → send to background) |
-| Background | `src/background/index.ts` | Service Worker | Watermark removal + file save + native download suppression |
+| Interceptor | `public/download-interceptor.js` | Main World | Patches `window.fetch` for Gemini download chain, posts captured image with `captureId` |
+| Content Script | `src/content/index.ts` | Isolated World | Shared panel + adapter orchestration |
+| Background | `src/background/index.ts` | Service Worker | Download processing, optional watermark removal, native blob-download suppression |
 
-**Download flow:**
+### Site Adapters
 
-1. Click the extension action icon → background sends `TOGGLE_PANEL` to the Gemini tab
-2. Content script scans page images and renders the in-page panel
-3. User selects images and clicks download
-4. Content script injects the Main World interceptor and enables download suppression
-5. For each image serially: click native download button → interceptor captures the blob via patched `fetch` → blob is forwarded to content script via `postMessage`
-6. Content script sends `DOWNLOAD_IMAGE` (with dataUrl + filename) to background
-7. Background removes the Gemini watermark and saves the file via `chrome.downloads`
+| Adapter | File | Download Strategy |
+|--------|------|-------------------|
+| Gemini | `src/content/adapters/gemini.ts` | Click native download button -> intercept final blob -> send `DOWNLOAD_IMAGE` |
+| NotebookLM | `src/content/adapters/notebooklm.ts` | Open infographic artifact -> read viewer image URL -> send `DOWNLOAD_IMAGE_URL` |
+
+## Message Flow
+
+- Action click -> Background -> Content Script: `TOGGLE_PANEL` / `OPEN_PANEL`
+- Content Script -> Background:
+  - `DOWNLOAD_IMAGE` (dataUrl + filename)
+  - `DOWNLOAD_IMAGE_URL` (imageUrl + filename + removeWatermark)
+  - `SUPPRESS_DOWNLOADS` (Gemini native blob suppression on/off)
+- Main World -> Content Script:
+  - `GBD_IMAGE_CAPTURED` (includes `captureId`)
+- Content Script -> Main World:
+  - `GBD_CAPTURE_EXPECT` / `GBD_CAPTURE_CANCEL`
 
 ## Tech Stack
 
@@ -48,21 +63,28 @@ The extension uses a 3-layer architecture:
 
 ```text
 src/
-  background/index.ts          # Action click handling + watermark removal + download suppression
-  content/index.ts             # Image scanning + in-page panel UI + download orchestration
+  background/index.ts                  # Action click + download processing + suppression
+  content/
+    index.ts                           # Shared panel + adapter coordinator
+    adapters/
+      index.ts                         # Host -> adapter routing
+      types.ts                         # Adapter contracts
+      viewport.ts                      # Lazy-load preloading helpers
+      gemini.ts                        # Gemini detection/download logic
+      notebooklm.ts                    # NotebookLM infographic logic
   core/
-    watermarkEngine.ts         # Watermark removal via reverse alpha blending
-    alphaMap.ts                # Pre-computed alpha channel map
-    blendModes.ts              # Blend mode utilities
-  types.ts                     # Shared message/data types
-  assets/                      # Watermark reference images
+    watermarkEngine.ts                 # Gemini watermark removal
+    alphaMap.ts
+    blendModes.ts
+  types.ts                             # Shared message/data types
+  assets/                              # Watermark reference images
 public/
-  download-interceptor.js      # Main World fetch patch (injected at runtime)
-  rules.json                   # Declarative net request CORS rules
-  icons/                       # Extension icons
-docs/                          # Operational & architecture docs
+  download-interceptor.js              # Main-world fetch patch for Gemini
+  rules.json                           # Declarative net request CORS rules
+  icons/                               # Extension icons
+docs/                                  # Operational docs
 manifest.json
-AGENTS.md                      # AI agent project context
+AGENTS.md
 ```
 
 ## Local Development
@@ -89,36 +111,49 @@ Build output is generated in `dist/`.
 
 ## Usage
 
+### Gemini
+
 1. Open `https://gemini.google.com/`
 2. Open a conversation with generated images
 3. Click the extension icon
-4. Use the panel in the top-right corner to choose images and download
+4. Select images in the in-page panel and start batch download
+
+### NotebookLM (Infographic)
+
+1. Open `https://notebooklm.google.com/`
+2. Open a notebook with generated Infographic artifacts in Studio
+3. Click the extension icon
+4. Select infographic items in the panel and start batch download
 
 ## Troubleshooting
 
-### Panel does not appear after clicking the icon
+### Panel does not appear
 
-- Refresh the Gemini page and try again (content script needs injection on the latest page state)
-- Make sure you loaded the latest `dist/`
+- Refresh the page and retry
+- Confirm the latest `dist/` build is loaded
+- Confirm the current page is `gemini.google.com` or `notebooklm.google.com`
 
-### No images are detected
+### Items are not detected on long pages
 
-- Confirm the conversation already has rendered generated images
-- Scroll to trigger lazy loading, then try again
+- Scroll the page once, then reopen the panel
+- Keep Studio/Conversation area visible while scanning
 
-### Downloads fail
+### Downloads fail or hang
 
-- Check Gemini login status
 - Check extension Errors / Service Worker logs in `chrome://extensions`
+- Ensure account login is valid on target site
+- Retry once after page refresh
 
 ## Permissions
 
-- `activeTab`: interact with the active tab via extension action flow
-- `downloads`: call Chrome downloads API
-- `declarativeNetRequestWithHostAccess`: modify response headers (CORS) for `lh3.googleusercontent.com` image requests
+- `activeTab`: action-based interaction with the active tab
+- `downloads`: save processed files via Chrome downloads API
+- `declarativeNetRequestWithHostAccess`: adjust CORS headers for image fetches
 - `host_permissions`:
-  - `https://gemini.google.com/*` — inject content script and interact with Gemini page
-  - `https://lh3.googleusercontent.com/*`, `https://lh3.google.com/*` — access image resources for watermark processing
+  - `https://gemini.google.com/*`
+  - `https://notebooklm.google.com/*`
+  - `https://lh3.googleusercontent.com/*`
+  - `https://lh3.google.com/*`
 
 ## License
 

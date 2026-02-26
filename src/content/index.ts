@@ -1,93 +1,15 @@
 import type { ImageInfo } from '../types';
+import { getAdapterForLocation } from './adapters';
+import type { DownloadDispatcher } from './adapters/types';
 
-/**
- * Content Script: 扫描 Gemini 页面中的生成图片，并在页面内渲染下载面板
- */
+console.log('[Banana Downloader] Content script injected');
 
-console.log('[Gemini Batch Downloader] Content script injected');
-
-const SIZE_SUFFIX_PATTERN = /=s\d+[^?#]*/i;
-const GOOGLE_USER_CONTENT_PATTERN = /googleusercontent\.com/i;
-const GEMINI_PATH_PATTERN = /\/(rd-gg(?:-dl)?|gg(?:-dl)?|aip-dl)\//i;
-const MIN_IMAGE_EDGE = 120;
-const DOWNLOAD_BUTTON_LABELS = [
-    'Download full size image',
-    '下载完整尺寸图片',
-    '下载全尺寸图片',
-    '下载图片',
-];
-const IMAGE_CONTAINER_SELECTOR = 'button.image-button, .overlay-container';
 const PANEL_HOST_ID = 'gbd-panel-host';
-const DOWNLOAD_BUTTON_SELECTOR = 'button[data-test-id="download-generated-image-button"]';
 
-// ── Main-world interceptor injection ──────────────────────────────────
-let interceptorInjected = false;
+const activeAdapter = getAdapterForLocation(window.location);
 
-function injectInterceptor(): void {
-    if (interceptorInjected) return;
-    interceptorInjected = true;
-    const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('download-interceptor.js');
-    (document.head || document.documentElement).appendChild(script);
-    script.onload = () => script.remove();
-}
-
-// Inject as early as possible so fetch is patched before any downloads
-injectInterceptor();
-
-// ── Blob capture via postMessage (FIFO queue for pipelined downloads) ─
-type BlobResolver = (dataUrl: string) => void;
-const pendingBlobQueue: BlobResolver[] = [];
-
-window.addEventListener('message', (event) => {
-    if (event.source !== window || event.data?.type !== 'GBD_IMAGE_CAPTURED') return;
-    const resolve = pendingBlobQueue.shift();
-    if (resolve) resolve(event.data.dataUrl);
-});
-
-// ── Download suppression control ─────────────────────────────────────
-// Notify background to cancel native blob: downloads via chrome.downloads API.
-// This is the reliable mechanism — works regardless of how the page triggers
-// the download (anchor.click, dispatchEvent, navigation, etc.)
-function setSuppressDownload(suppress: boolean): void {
-    chrome.runtime.sendMessage({ type: 'SUPPRESS_DOWNLOADS', suppress });
-}
-
-// ── Find the native "Download full size" button for a given image ────
-function findDownloadButton(thumbnailUrl: string): HTMLButtonElement | null {
-    const allImages = document.querySelectorAll('img');
-    let targetImg: HTMLImageElement | null = null;
-    for (const img of allImages) {
-        if ((img.currentSrc || img.src) === thumbnailUrl) {
-            targetImg = img;
-            break;
-        }
-    }
-    if (!targetImg) return null;
-
-    const container = targetImg.closest('.overlay-container');
-    if (!container) return null;
-
-    return container.querySelector<HTMLButtonElement>(DOWNLOAD_BUTTON_SELECTOR);
-}
-
-// ── Click native download and wait for intercepted blob ──────────────
-function clickAndWaitForBlob(button: HTMLButtonElement, timeoutMs = 30000): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => {
-            const idx = pendingBlobQueue.indexOf(onBlob);
-            if (idx !== -1) pendingBlobQueue.splice(idx, 1);
-            reject(new Error('等待原生下载响应超时'));
-        }, timeoutMs);
-
-        const onBlob: BlobResolver = (dataUrl: string) => {
-            clearTimeout(timer);
-            resolve(dataUrl);
-        };
-
-        pendingBlobQueue.push(onBlob);
-        button.click();
-    });
+if (!activeAdapter) {
+    console.warn('[Banana Downloader] No adapter matched for', window.location.hostname);
 }
 
 type PanelStatus = 'idle' | 'loading' | 'ready' | 'error' | 'downloading' | 'done';
@@ -104,6 +26,7 @@ interface PanelState {
 
 interface PanelElements {
     panel: HTMLDivElement;
+    title: HTMLDivElement;
     closeButton: HTMLButtonElement;
     status: HTMLDivElement;
     toolbar: HTMLDivElement;
@@ -115,6 +38,7 @@ interface PanelElements {
     progressFill: HTMLDivElement;
     progressText: HTMLSpanElement;
     result: HTMLDivElement;
+    footer: HTMLDivElement;
     downloadButton: HTMLButtonElement;
 }
 
@@ -122,7 +46,7 @@ const state: PanelState = {
     visible: false,
     status: 'idle',
     images: [],
-    prefix: 'gemini',
+    prefix: activeAdapter?.defaultPrefix ?? 'banana',
     progress: { completed: 0, total: 0 },
     result: { succeeded: 0, failed: 0 },
     errorMessage: '',
@@ -134,137 +58,68 @@ let panelElements: PanelElements | null = null;
 let refreshScheduled = false;
 let renderScheduled = false;
 
-function rewriteSizeToken(url: string, target: string): string {
-    if (SIZE_SUFFIX_PATTERN.test(url)) {
-        return url.replace(SIZE_SUFFIX_PATTERN, target);
-    }
+function setSuppressDownload(suppress: boolean): void {
+    chrome.runtime.sendMessage({ type: 'SUPPRESS_DOWNLOADS', suppress });
+}
 
-    if (!GOOGLE_USER_CONTENT_PATTERN.test(url)) {
-        return url;
-    }
+function sendRuntimeMessage<TResponse>(message: unknown, timeoutMs = 60000): Promise<TResponse> {
+    return new Promise<TResponse>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+            reject(new Error(`消息超时(${timeoutMs}ms)`));
+        }, timeoutMs);
 
-    // 兜底：Gemini 资源无 size token 时直接追加 =s0
-    if (GEMINI_PATH_PATTERN.test(url)) {
-        const queryOrHashIndex = url.search(/[?#]/);
-        if (queryOrHashIndex === -1) {
-            return `${url}${target}`;
+        try {
+            chrome.runtime.sendMessage(message, (response: TResponse | undefined) => {
+                window.clearTimeout(timer);
+
+                if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                    return;
+                }
+
+                resolve(response as TResponse);
+            });
+        } catch (error) {
+            window.clearTimeout(timer);
+            reject(error instanceof Error ? error : new Error(String(error)));
         }
-        return `${url.slice(0, queryOrHashIndex)}${target}${url.slice(queryOrHashIndex)}`;
-    }
-
-    return url;
+    });
 }
 
-function toFullSizeUrl(url: string): string {
-    return rewriteSizeToken(url, '=s0');
+async function downloadFromDataUrl(dataUrl: string, filename: string): Promise<void> {
+    const result = await sendRuntimeMessage<{ success: boolean; error?: string }>({
+        type: 'DOWNLOAD_IMAGE',
+        dataUrl,
+        filename,
+    }, 120000);
+
+    if (!result?.success) {
+        throw new Error(result?.error || '下载失败');
+    }
 }
 
-function getVisualEdge(img: HTMLImageElement): number {
-    const rect = img.getBoundingClientRect();
-    return Math.max(img.naturalWidth, img.naturalHeight, rect.width, rect.height);
+async function downloadFromUrl(
+    imageUrl: string,
+    filename: string,
+    options?: { removeWatermark?: boolean },
+): Promise<void> {
+    const result = await sendRuntimeMessage<{ success: boolean; error?: string }>({
+        type: 'DOWNLOAD_IMAGE_URL',
+        imageUrl,
+        filename,
+        removeWatermark: options?.removeWatermark,
+    }, 120000);
+
+    if (!result?.success) {
+        throw new Error(result?.error || '下载失败');
+    }
 }
 
-function hasNearbyDownloadButton(img: HTMLImageElement): boolean {
-    const container = img.closest('figure, div, article, button');
-    if (!container) {
-        return false;
-    }
-
-    return DOWNLOAD_BUTTON_LABELS.some((label) =>
-        container.querySelector(`button[aria-label*="${label}"]`) !== null
-    );
-}
-
-function isLikelyGeminiImage(img: HTMLImageElement, url: string): boolean {
-    if (!url || url.startsWith('data:') || url.startsWith('blob:')) {
-        return false;
-    }
-
-    // Exclude user-uploaded reference images
-    if (img.closest('user-query-file-preview, user-query-file-carousel')) {
-        return false;
-    }
-
-    if (img.closest(IMAGE_CONTAINER_SELECTOR)) {
-        return true;
-    }
-
-    if (GEMINI_PATH_PATTERN.test(url)) {
-        return true;
-    }
-
-    const hasGoogleContentHost = GOOGLE_USER_CONTENT_PATTERN.test(url);
-    if (!hasGoogleContentHost && !hasNearbyDownloadButton(img)) {
-        return false;
-    }
-
-    if (hasNearbyDownloadButton(img)) {
-        return true;
-    }
-
-    return getVisualEdge(img) >= MIN_IMAGE_EDGE;
-}
-
-function collectImagesFromRoot(root: Document | ShadowRoot): HTMLImageElement[] {
-    const images = Array.from(root.querySelectorAll('img'));
-    const ownerDocument = root instanceof Document ? root : root.ownerDocument;
-    const walker = ownerDocument.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-
-    let currentNode = walker.nextNode();
-    while (currentNode) {
-        if (currentNode instanceof HTMLElement && currentNode.shadowRoot) {
-            if (currentNode.id !== PANEL_HOST_ID) {
-                images.push(...collectImagesFromRoot(currentNode.shadowRoot));
-            }
-        }
-        currentNode = walker.nextNode();
-    }
-
-    return images;
-}
-
-function scanImages(): ImageInfo[] {
-    const allImages = collectImagesFromRoot(document);
-    const uniqueImages = new Map<
-        string,
-        { image: Omit<ImageInfo, 'id'>; score: number }
-    >();
-
-    for (const img of allImages) {
-        if (panelRoot && img.getRootNode() === panelRoot) {
-            continue;
-        }
-
-        const sourceUrl = img.currentSrc || img.src || '';
-        if (!isLikelyGeminiImage(img, sourceUrl)) {
-            continue;
-        }
-
-        const fullSizeUrl = toFullSizeUrl(sourceUrl);
-        const score = getVisualEdge(img);
-        const candidate = {
-            thumbnailUrl: sourceUrl,
-            fullSizeUrl,
-            selected: true,
-        };
-        const existing = uniqueImages.get(fullSizeUrl);
-
-        if (!existing || score > existing.score) {
-            uniqueImages.set(fullSizeUrl, { image: candidate, score });
-        }
-    }
-
-    const result = Array.from(uniqueImages.values()).map((entry, index) => ({
-        id: index,
-        ...entry.image,
-    }));
-
-    console.log(
-        `[Gemini Batch Downloader] Scanned ${allImages.length} <img>, matched ${result.length} Gemini images`
-    );
-
-    return result;
-}
+const downloadDispatcher: DownloadDispatcher = {
+    setSuppressDownload,
+    downloadFromDataUrl,
+    downloadFromUrl,
+};
 
 function scheduleRender(): void {
     if (renderScheduled) {
@@ -357,7 +212,7 @@ function ensurePanel(): void {
         }
         .prefix {
           margin-left: auto;
-          width: 140px;
+          width: 150px;
           background: #0d1429;
           color: #e5ecff;
           border: 1px solid #2b477a;
@@ -383,6 +238,8 @@ function ensurePanel(): void {
           cursor: pointer;
           background: #0d1429;
           aspect-ratio: 3 / 4;
+          color: #d9e7ff;
+          text-align: left;
         }
         .card.selected {
           border-color: #4a9eff;
@@ -394,6 +251,18 @@ function ensurePanel(): void {
           object-fit: cover;
           display: block;
           background: #0a1021;
+        }
+        .placeholder {
+          width: 100%;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 8px;
+          text-align: center;
+          font-size: 11px;
+          line-height: 1.35;
+          background: linear-gradient(145deg, #15284f, #0d1934);
         }
         .badge {
           position: absolute;
@@ -467,7 +336,7 @@ function ensurePanel(): void {
       </style>
       <div class="panel hidden" data-role="panel">
         <div class="header">
-          <div class="title">Gemini 图片批量下载</div>
+          <div class="title" data-role="title">Banana 下载器</div>
           <button class="close" type="button" data-role="close">×</button>
         </div>
         <div class="status" data-role="status"></div>
@@ -500,6 +369,7 @@ function ensurePanel(): void {
 
     panelElements = {
         panel: queryRequired<HTMLDivElement>('[data-role="panel"]'),
+        title: queryRequired<HTMLDivElement>('[data-role="title"]'),
         closeButton: queryRequired<HTMLButtonElement>('[data-role="close"]'),
         status: queryRequired<HTMLDivElement>('[data-role="status"]'),
         toolbar: queryRequired<HTMLDivElement>('[data-role="toolbar"]'),
@@ -511,6 +381,7 @@ function ensurePanel(): void {
         progressFill: queryRequired<HTMLDivElement>('[data-role="progress-fill"]'),
         progressText: queryRequired<HTMLSpanElement>('[data-role="progress-text"]'),
         result: queryRequired<HTMLDivElement>('[data-role="result"]'),
+        footer: queryRequired<HTMLDivElement>('[data-role="footer"]'),
         downloadButton: queryRequired<HTMLButtonElement>('[data-role="download"]'),
     };
 
@@ -520,7 +391,7 @@ function ensurePanel(): void {
 
     panelElements.prefixInput.value = state.prefix;
     panelElements.prefixInput.addEventListener('input', () => {
-        state.prefix = panelElements?.prefixInput.value.trim() || 'gemini';
+        state.prefix = panelElements?.prefixInput.value.trim() || activeAdapter?.defaultPrefix || 'banana';
     });
 
     panelElements.selectAll.addEventListener('change', () => {
@@ -546,13 +417,13 @@ function ensurePanel(): void {
         }
 
         state.images = state.images.map((image) =>
-            image.id === id ? { ...image, selected: !image.selected } : image
+            image.id === id ? { ...image, selected: !image.selected } : image,
         );
         scheduleRender();
     });
 
     panelElements.downloadButton.addEventListener('click', () => {
-        startDownload();
+        void startDownload();
     });
 }
 
@@ -565,15 +436,23 @@ function renderGrid(elements: PanelElements): void {
         card.className = `card ${image.selected ? 'selected' : ''}`;
         card.dataset.id = String(image.id);
 
-        const img = document.createElement('img');
-        img.src = image.thumbnailUrl;
-        img.alt = `Image ${image.id + 1}`;
-        img.loading = 'lazy';
-        img.addEventListener('error', () => {
-            if (img.src !== image.fullSizeUrl) {
-                img.src = image.fullSizeUrl;
-            }
-        });
+        if (image.thumbnailUrl) {
+            const img = document.createElement('img');
+            img.src = image.thumbnailUrl;
+            img.alt = image.title || `Image ${image.id + 1}`;
+            img.loading = 'lazy';
+            img.addEventListener('error', () => {
+                if (img.src !== image.fullSizeUrl) {
+                    img.src = image.fullSizeUrl;
+                }
+            });
+            card.appendChild(img);
+        } else {
+            const placeholder = document.createElement('div');
+            placeholder.className = 'placeholder';
+            placeholder.textContent = image.title || `项目 #${image.id + 1}`;
+            card.appendChild(placeholder);
+        }
 
         const check = document.createElement('span');
         check.className = 'check';
@@ -583,7 +462,7 @@ function renderGrid(elements: PanelElements): void {
         badge.className = 'badge';
         badge.textContent = `#${image.id + 1}`;
 
-        card.append(img, check, badge);
+        card.append(check, badge);
         elements.grid.appendChild(card);
     }
 }
@@ -596,6 +475,7 @@ function renderPanel(): void {
     const elements = panelElements;
     const selectedCount = state.images.filter((image) => image.selected).length;
     const allSelected = state.images.length > 0 && selectedCount === state.images.length;
+    const entityName = activeAdapter?.entityName || '项目';
 
     elements.panel.classList.toggle('hidden', !state.visible);
 
@@ -603,19 +483,20 @@ function renderPanel(): void {
         return;
     }
 
+    elements.title.textContent = activeAdapter?.panelTitle || 'Banana 下载器';
     elements.selectAll.checked = allSelected;
     elements.selectText.textContent = `全选 (${selectedCount}/${state.images.length})`;
     elements.prefixInput.value = state.prefix;
 
     if (state.status === 'loading') {
-        elements.status.textContent = '正在检测 Gemini 图片...';
+        elements.status.textContent = `正在检测 ${entityName}...`;
         elements.toolbar.classList.add('hidden');
         elements.grid.classList.add('hidden');
         elements.progress.classList.add('hidden');
         elements.result.classList.add('hidden');
+        elements.footer.classList.add('hidden');
         elements.downloadButton.disabled = true;
         elements.downloadButton.textContent = '下载选中 (0)';
-        elements.downloadButton.parentElement?.classList.add('hidden');
         return;
     }
 
@@ -625,25 +506,22 @@ function renderPanel(): void {
         elements.grid.classList.add('hidden');
         elements.progress.classList.add('hidden');
         elements.result.classList.add('hidden');
+        elements.footer.classList.add('hidden');
         elements.downloadButton.disabled = true;
         elements.downloadButton.textContent = '下载选中 (0)';
-        elements.downloadButton.parentElement?.classList.add('hidden');
         return;
     }
 
-    elements.status.textContent = `已检测到 ${state.images.length} 张 Gemini 图片`;
+    elements.status.textContent = `已检测到 ${state.images.length} 个${entityName}`;
     elements.toolbar.classList.remove('hidden');
     elements.grid.classList.remove('hidden');
-    elements.downloadButton.parentElement?.classList.remove('hidden');
+    elements.footer.classList.remove('hidden');
 
     renderGrid(elements);
 
     if (state.status === 'downloading') {
         const total = state.progress.total || 1;
-        const percent = Math.max(
-            0,
-            Math.min(100, (state.progress.completed / total) * 100)
-        );
+        const percent = Math.max(0, Math.min(100, (state.progress.completed / total) * 100));
         elements.progress.classList.remove('hidden');
         elements.progressFill.style.width = `${percent}%`;
         elements.progressText.textContent = `下载中 ${state.progress.completed}/${state.progress.total}`;
@@ -654,7 +532,7 @@ function renderPanel(): void {
 
     if (state.status === 'done') {
         elements.result.classList.remove('hidden');
-        elements.result.textContent = `完成：成功 ${state.result.succeeded} 张，失败 ${state.result.failed} 张`;
+        elements.result.textContent = `完成：成功 ${state.result.succeeded} 个，失败 ${state.result.failed} 个`;
     } else {
         elements.result.classList.add('hidden');
         elements.result.textContent = '';
@@ -673,18 +551,26 @@ function renderPanel(): void {
 }
 
 function refreshImages(): void {
-    const nextImages = scanImages();
+    if (!activeAdapter) {
+        state.images = [];
+        state.status = 'error';
+        state.errorMessage = `当前页面暂不支持：${window.location.hostname}`;
+        scheduleRender();
+        return;
+    }
+
+    const nextImages = activeAdapter.scanImages();
 
     if (nextImages.length === 0) {
         state.images = [];
         state.status = 'error';
-        state.errorMessage = '当前页面未检测到 Gemini 生成的图片';
+        state.errorMessage = activeAdapter.emptyMessage;
         scheduleRender();
         return;
     }
 
     const previousSelection = new Map(
-        state.images.map((image) => [image.fullSizeUrl, image.selected])
+        state.images.map((image) => [image.fullSizeUrl, image.selected]),
     );
 
     state.images = nextImages.map((image) => ({
@@ -713,15 +599,32 @@ function scheduleRefreshFromMutation(): void {
     window.setTimeout(() => {
         refreshScheduled = false;
         refreshImages();
-    }, 200);
+    }, 220);
 }
 
-function openPanel(): void {
+async function openPanel(): Promise<void> {
     ensurePanel();
     state.visible = true;
     state.status = 'loading';
     state.errorMessage = '';
+
+    if (activeAdapter) {
+        state.prefix = activeAdapter.defaultPrefix;
+    }
+
     scheduleRender();
+
+    if (activeAdapter?.prepareForScan) {
+        try {
+            await activeAdapter.prepareForScan();
+        } catch (error) {
+            state.status = 'error';
+            state.errorMessage = `准备扫描失败：${String(error)}`;
+            scheduleRender();
+            return;
+        }
+    }
+
     refreshImages();
 }
 
@@ -736,11 +639,16 @@ function togglePanel(): void {
         return;
     }
 
-    openPanel();
+    void openPanel();
+}
+
+function buildBatchTimestamp(): string {
+    const now = new Date();
+    return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
 }
 
 async function startDownload(): Promise<void> {
-    if (state.status === 'downloading') {
+    if (!activeAdapter || state.status === 'downloading') {
         return;
     }
 
@@ -754,54 +662,47 @@ async function startDownload(): Promise<void> {
     state.result = { succeeded: 0, failed: 0 };
     scheduleRender();
 
-    const prefix = state.prefix || 'gemini';
-    const now = new Date();
-    const batch = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+    const prefix = state.prefix || activeAdapter.defaultPrefix;
+    const batch = buildBatchTimestamp();
 
-    // Ensure interceptor is injected and suppress native downloads
-    injectInterceptor();
-    setSuppressDownload(true);
+    let setupSucceeded = false;
 
-    for (let i = 0; i < selectedImages.length; i++) {
-        const image = selectedImages[i];
-        const filename = `${prefix}_${batch}_${i + 1}.png`;
+    try {
+        if (activeAdapter.beforeBatchDownload) {
+            await activeAdapter.beforeBatchDownload(downloadDispatcher);
+        }
+        setupSucceeded = true;
 
-        try {
-            const button = findDownloadButton(image.thumbnailUrl);
-            if (!button) {
-                throw new Error('未找到对应的原生下载按钮');
+        for (let i = 0; i < selectedImages.length; i++) {
+            const image = selectedImages[i];
+            const filename = `${prefix}_${batch}_${i + 1}.png`;
+
+            try {
+                await activeAdapter.downloadImage(image, filename, downloadDispatcher);
+                state.result.succeeded++;
+            } catch (error) {
+                console.error(`[Banana Downloader] Failed to download item ${i + 1}:`, error);
+                state.result.failed++;
             }
 
-            const dataUrl = await clickAndWaitForBlob(button);
-
-            await new Promise<void>((resolve, reject) => {
-                chrome.runtime.sendMessage(
-                    { type: 'DOWNLOAD_IMAGE', dataUrl, filename },
-                    (res: { success: boolean; error?: string } | undefined) => {
-                        if (chrome.runtime.lastError) {
-                            reject(new Error(chrome.runtime.lastError.message));
-                            return;
-                        }
-                        if (res?.success) {
-                            resolve();
-                        } else {
-                            reject(new Error(res?.error || '下载失败'));
-                        }
-                    },
-                );
-            });
-
-            state.result.succeeded++;
-        } catch (error) {
-            console.error(`[Gemini Batch Downloader] Failed to download image ${i + 1}:`, error);
-            state.result.failed++;
+            state.progress.completed = i + 1;
+            scheduleRender();
         }
-
-        state.progress.completed = i + 1;
+    } catch (error) {
+        state.status = 'error';
+        state.errorMessage = `批量下载启动失败：${String(error)}`;
         scheduleRender();
+        return;
+    } finally {
+        if (setupSucceeded && activeAdapter.afterBatchDownload) {
+            try {
+                await activeAdapter.afterBatchDownload(downloadDispatcher);
+            } catch (error) {
+                console.error('[Banana Downloader] afterBatchDownload failed:', error);
+            }
+        }
     }
 
-    setSuppressDownload(false);
     state.status = 'done';
     scheduleRender();
 }
@@ -822,11 +723,11 @@ chrome.runtime.onMessage.addListener((message) => {
     }
 
     if (message.type === 'OPEN_PANEL') {
-        openPanel();
+        void openPanel();
         return false;
     }
 
     return false;
 });
 
-console.log('[Gemini Batch Downloader] Panel bridge ready');
+console.log('[Banana Downloader] Panel bridge ready');

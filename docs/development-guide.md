@@ -6,94 +6,114 @@
 graph LR
     A[Action Click] --> B[Background]
     B -->|TOGGLE_PANEL / OPEN_PANEL| C[Content Script]
-    C -->|Scan images + render Shadow DOM panel| D[Gemini Page]
-    C -->|DOWNLOAD_IMAGES| B
+    C -->|Adapter scan + Shadow DOM panel| D[Target Page]
+    C -->|DOWNLOAD_IMAGE / DOWNLOAD_IMAGE_URL| B
     B -->|chrome.downloads| E[Browser Download Manager]
-    B -->|DOWNLOAD_PROGRESS| C
 ```
 
 Notes:
 
-- The extension no longer uses a popup page. UI is fully rendered inside the content script.
-- Extension icon click is handled by background, which decides whether to toggle the panel or open Gemini first.
+- No popup page. UI is rendered in content script shadow DOM.
+- Background decides whether to toggle panel on supported tab or open a default tab.
+- Supported hosts: `gemini.google.com`, `notebooklm.google.com`.
 
 ## 2. Core Modules
 
 ### 2.1 `src/background/index.ts`
 
-- Listens to `chrome.action.onClicked`
-- Sends `TOGGLE_PANEL` for Gemini tabs
-- Opens a new Gemini tab (if needed) and sends `OPEN_PANEL` after load
-- Receives `DOWNLOAD_IMAGES` and runs batch download
-- Broadcasts `DOWNLOAD_PROGRESS`
+- Handles action click
+- Sends `TOGGLE_PANEL` / `OPEN_PANEL`
+- Handles:
+  - `DOWNLOAD_IMAGE` (dataUrl)
+  - `DOWNLOAD_IMAGE_URL` (imageUrl)
+  - `SUPPRESS_DOWNLOADS`
+- Applies optional watermark removal before save
+- Suppresses duplicate native `blob:` downloads during Gemini batch flow
 
 ### 2.2 `src/content/index.ts`
 
-- Scans page images and detects Gemini-generated images
-- Builds/updates panel via `ShadowRoot`
-- Manages panel state: `idle/loading/ready/error/downloading/done`
-- Handles select all / unselect all, filename prefix input, and download trigger
+- Shared in-page panel and state management
+- Host-based adapter selection and orchestration
+- Common download loop and progress updates
+- Runtime message timeout protection for background calls
 
-### 2.3 `src/types.ts`
+### 2.3 `src/content/adapters/*`
 
-- Defines shared image and message types
+- `index.ts`: host -> adapter route
+- `types.ts`: adapter interfaces
+- `viewport.ts`: lazy-load preloading helpers
+- `gemini.ts`: Gemini-specific detection/download logic
+- `notebooklm.ts`: NotebookLM infographic detection/download logic
 
-## 3. Image Detection and URL Handling
+### 2.4 `public/download-interceptor.js`
 
-### 3.1 Image Detection Strategy (multi-signal)
+- Main-world fetch patch for Gemini download chain
+- Uses `captureId` mapping (`GBD_CAPTURE_EXPECT` / `GBD_CAPTURE_CANCEL`)
+- Posts `GBD_IMAGE_CAPTURED` back to content script
 
-- Container signal: `button.image-button`, `.overlay-container`
-- URL path signal: `/gg-dl/` or `/aip-dl/`
-- Nearby button signal: labels like “Download full size image”
-- Visual size filter to avoid small/noisy images
+## 3. Site Flows
 
-### 3.2 Full-Size URL Rule
+### 3.1 Gemini
 
-- Detects Google image suffix parameters (for example `=s1024-rj`)
-- Rewrites to `=s0` for full-resolution download
+1. Scan generated images from conversation DOM
+2. User selects images in panel
+3. For each image: find native download button and click
+4. Interceptor captures final image response (`image/*`) and posts data URL with `captureId`
+5. Content script sends `DOWNLOAD_IMAGE` to background
+6. Background removes watermark and saves file
 
-## 4. Local Development Workflow
+### 3.2 NotebookLM (Infographic)
+
+1. Scan `artifact-button-content` entries and keep infographic items
+2. For each selected item: open artifact viewer
+3. Read viewer image URL (`/notebooklm/` or `/rd-notebooklm/`)
+4. Send `DOWNLOAD_IMAGE_URL` to background
+5. Background fetches and saves file (no watermark removal)
+
+## 4. Reliability Strategy
+
+- Preload lazy content before scanning/downloading
+- Retry with scroll-container sweep when target element is missing
+- Use `captureId` to avoid timeout-related blob mismatch
+- Add runtime message timeout guards to avoid stuck batch loops
+
+## 5. Local Development Workflow
 
 ```bash
 pnpm install
 pnpm dev
+pnpm build
 ```
 
 Load extension in Chrome:
 
 1. Open `chrome://extensions`
 2. Enable Developer mode
-3. Click “Load unpacked”
+3. Click "Load unpacked"
 4. Select `dist/`
 
-Build command:
+## 6. Debugging Guide
 
-```bash
-pnpm build
-```
+### 6.1 Panel does not appear
 
-## 5. Debugging Guide
+- Confirm page host is supported
+- Refresh the page and retry
+- Check service worker logs for `sendPanelMessage failed`
 
-### 5.1 Panel does not appear
+### 6.2 No items detected
 
-- Confirm current page is `https://gemini.google.com/*`
-- Refresh the page and try again
-- Check Service Worker logs for `sendPanelMessage failed`
+- Scroll page manually once, then reopen panel
+- Check content-script logs for adapter scan results
 
-### 5.2 No images detected
+### 6.3 Download failures
 
-- Open Gemini page console and inspect scan logs:
-  - `[banana-downloader] Scanned X <img>, matched Y Gemini images`
-- Scroll the page to trigger lazy loading, then retry
+- Check extension Errors panel and background logs
+- Verify login/session state on target site
+- Retry after refresh to reset page/runtime state
 
-### 5.3 Download failures
-
-- Check login status
-- Check extension Errors panel and Background logs
-
-## 6. Constraints and Conventions
+## 7. Constraints and Conventions
 
 - Use `pnpm`
 - Keep Manifest V3 compatibility
-- Keep panel visual style dark and aligned with Gemini
-- Add new behaviors through explicit message types, avoid implicit string protocols
+- Keep panel dark theme and consistent with target site UI
+- Add new behavior through explicit message types

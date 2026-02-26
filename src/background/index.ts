@@ -1,29 +1,35 @@
 /**
- * Background Service Worker: 处理面板切换、图片下载（fetch + 去水印 + 保存）
- * Service Worker 拥有 host_permissions，可绕过 CORS 直接 fetch 图片。
+ * Background Service Worker: 处理面板切换、图片下载（fetch + 可选去水印 + 保存）
  */
 
 import { removeWatermarkFromBlob } from '../core/watermarkEngine.ts';
 
-function isGeminiTab(tab: chrome.tabs.Tab): boolean {
-    return typeof tab.url === 'string' && tab.url.startsWith('https://gemini.google.com/');
+const GEMINI_HOME_URL = 'https://gemini.google.com/';
+const NOTEBOOKLM_HOME_URL = 'https://notebooklm.google.com/';
+
+function isSupportedTab(tab: chrome.tabs.Tab): boolean {
+    if (typeof tab.url !== 'string') {
+        return false;
+    }
+
+    return tab.url.startsWith(GEMINI_HOME_URL) || tab.url.startsWith(NOTEBOOKLM_HOME_URL);
 }
 
 function sendPanelMessage(tabId: number, type: 'TOGGLE_PANEL' | 'OPEN_PANEL'): void {
     chrome.tabs.sendMessage(tabId, { type }, () => {
         if (chrome.runtime.lastError) {
-            console.debug('[Gemini Batch Downloader] sendPanelMessage failed:', chrome.runtime.lastError.message);
+            console.debug('[Banana Downloader] sendPanelMessage failed:', chrome.runtime.lastError.message);
         }
     });
 }
 
 chrome.action.onClicked.addListener((tab) => {
-    if (tab.id && isGeminiTab(tab)) {
+    if (tab.id && isSupportedTab(tab)) {
         sendPanelMessage(tab.id, 'TOGGLE_PANEL');
         return;
     }
 
-    chrome.tabs.create({ url: 'https://gemini.google.com/' }, (createdTab) => {
+    chrome.tabs.create({ url: GEMINI_HOME_URL }, (createdTab) => {
         if (!createdTab?.id) {
             return;
         }
@@ -41,11 +47,6 @@ chrome.action.onClicked.addListener((tab) => {
     });
 });
 
-// ── Suppress Gemini native blob downloads during batch flow ───────────
-// This is the most reliable approach: chrome.downloads.onCreated fires
-// regardless of HOW the download was initiated (anchor.click, dispatchEvent,
-// Navigation, etc.). Our own downloads use data: URLs, so we only cancel
-// blob: downloads that we didn't initiate.
 let suppressNativeDownloads = false;
 const ownDownloadIds = new Set<number>();
 
@@ -56,18 +57,25 @@ chrome.downloads.onCreated.addListener((item) => {
     }
 });
 
-async function processAndDownload(dataUrl: string, filename: string): Promise<{ success: boolean; error?: string }> {
-    // dataUrl 由 content script 从 Gemini 原生下载流程中拦截得到
-    const response = await fetch(dataUrl);
-    let blob = await response.blob();
-    blob = await removeWatermarkFromBlob(blob);
-
-    const processedDataUrl = await new Promise<string>((resolve, reject) => {
+async function blobToDataUrl(blob: Blob): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result as string);
         reader.onerror = () => reject(reader.error);
         reader.readAsDataURL(blob);
     });
+}
+
+async function processBlob(blob: Blob, removeWatermark: boolean): Promise<Blob> {
+    if (!removeWatermark) {
+        return blob;
+    }
+
+    return removeWatermarkFromBlob(blob);
+}
+
+async function saveBlobAsDownload(blob: Blob, filename: string): Promise<{ success: boolean; error?: string }> {
+    const processedDataUrl = await blobToDataUrl(blob);
 
     return new Promise((resolve) => {
         chrome.downloads.download(
@@ -81,7 +89,9 @@ async function processAndDownload(dataUrl: string, filename: string): Promise<{ 
                 ownDownloadIds.add(downloadId);
 
                 const listener = (delta: chrome.downloads.DownloadDelta) => {
-                    if (delta.id !== downloadId) return;
+                    if (delta.id !== downloadId) {
+                        return;
+                    }
 
                     if (delta.state?.current === 'complete') {
                         chrome.downloads.onChanged.removeListener(listener);
@@ -93,10 +103,37 @@ async function processAndDownload(dataUrl: string, filename: string): Promise<{ 
                         resolve({ success: false, error: delta.error?.current });
                     }
                 };
+
                 chrome.downloads.onChanged.addListener(listener);
             },
         );
     });
+}
+
+async function processAndDownloadDataUrl(
+    dataUrl: string,
+    filename: string,
+    removeWatermark: boolean,
+): Promise<{ success: boolean; error?: string }> {
+    const response = await fetch(dataUrl);
+    const sourceBlob = await response.blob();
+    const finalBlob = await processBlob(sourceBlob, removeWatermark);
+    return saveBlobAsDownload(finalBlob, filename);
+}
+
+async function processAndDownloadImageUrl(
+    imageUrl: string,
+    filename: string,
+    removeWatermark: boolean,
+): Promise<{ success: boolean; error?: string }> {
+    const response = await fetch(imageUrl, { credentials: 'include' });
+    if (!response.ok) {
+        throw new Error(`远程图片下载失败: ${response.status}`);
+    }
+
+    const sourceBlob = await response.blob();
+    const finalBlob = await processBlob(sourceBlob, removeWatermark);
+    return saveBlobAsDownload(finalBlob, filename);
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -112,12 +149,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             filename: string;
         };
 
-        processAndDownload(dataUrl, filename)
+        processAndDownloadDataUrl(dataUrl, filename, true)
             .then(sendResponse)
             .catch((err) => sendResponse({ success: false, error: String(err) }));
 
-        return true; // 异步 sendResponse
+        return true;
     }
+
+    if (message.type === 'DOWNLOAD_IMAGE_URL') {
+        const { imageUrl, filename, removeWatermark } = message as {
+            type: 'DOWNLOAD_IMAGE_URL';
+            imageUrl: string;
+            filename: string;
+            removeWatermark?: boolean;
+        };
+
+        processAndDownloadImageUrl(imageUrl, filename, removeWatermark ?? true)
+            .then(sendResponse)
+            .catch((err) => sendResponse({ success: false, error: String(err) }));
+
+        return true;
+    }
+
+    return false;
 });
 
-console.log('[Gemini Batch Downloader] Background service worker loaded');
+console.log('[Banana Downloader] Background service worker loaded');
